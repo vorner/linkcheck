@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Error};
 use bytes::Bytes;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Duration as ChronoDuration, Local};
 use err_derive::Error;
 use futures::future;
 use im::Vector;
@@ -35,6 +35,15 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .build()
         .unwrap()
 });
+
+struct FormattedDur(Duration);
+
+impl Display for FormattedDur {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        let dur = ChronoDuration::from_std(self.0).unwrap_or_else(|_| ChronoDuration::zero());
+        write!(f, "{:02}:{:02}:{:02}", dur.num_hours(), dur.num_minutes() % 60, dur.num_seconds() % 60)
+    }
+}
 
 #[allow(dead_code)] // Used as part of debug impl
 #[derive(Debug, Deserialize)]
@@ -399,9 +408,8 @@ impl PrinterStatus {
         let took = now.elapsed();
 
         debug!(
-            "Step on {}/{} took {:?}",
+            "Step on {} took {:?}",
             self.info.name,
-            self.selected.unwrap(),
             took
         );
         self.last_duration = took;
@@ -455,11 +463,11 @@ impl Display for PrinterStatus {
                     let end: DateTime<Local> = (SystemTime::now() + *time_left).into();
                     writeln!(
                         f,
-                        "Printing: {:?} Left: {:?} Total: {:?} End: {}{} <{}>",
-                        time_spent,
-                        time_left,
-                        *time_spent + *time_left,
-                        end,
+                        "Printing: {} Left: {} Total: {} End: {}{} <{}>",
+                        FormattedDur(*time_spent),
+                        FormattedDur(*time_left),
+                        FormattedDur(*time_spent + *time_left),
+                        end.format("%F %R"),
                         if *paused { " (paused)" } else { "" },
                         name,
                     )?;
