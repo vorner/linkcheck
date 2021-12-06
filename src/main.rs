@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::File;
+use std::iter;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -159,6 +160,10 @@ struct Opts {
     /// Contains connection info for the printers. Yaml.
     #[structopt(parse(from_os_str))]
     config: Option<PathBuf>,
+
+    /// Use raw ugly output to preserve logs and everything.
+    #[structopt(long, short)]
+    ugly: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -229,7 +234,7 @@ impl Snapshot {
         let paused = printer.state.flags.paused || printer.state.flags.pausing;
         if active {
             Snapshot::Active {
-                done: job.progress.completion,
+                done: job.progress.completion * 100.0,
                 time_spent: Duration::from_secs(job.progress.print_time),
                 time_left: Duration::from_secs(job.progress.print_time_left),
                 telemetry,
@@ -418,10 +423,7 @@ impl PrinterStatus {
 
 impl Display for PrinterStatus {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        writeln!(
-            f,
-            "======================================================================"
-        )?;
+        writeln!(f, "{}", iter::repeat('=').take(self.info.opts.history).collect::<String>())?;
         if let Some(addr) = self.selected {
             writeln!(f, "{}: {} [{:?}]", self.info.name, addr, self.last_duration)?;
         } else {
@@ -609,6 +611,10 @@ async fn main() -> Result<(), Error> {
     }
 
     loop {
+        if !opts.ugly {
+            print!("\x1B[2J\x1B[1;1H");
+        }
+
         for printer in &mut watched_printers {
             println!("{}", *printer.borrow_and_update());
         }
