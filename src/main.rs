@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::File;
@@ -447,11 +447,13 @@ impl Display for PrinterStatus {
         for snap in &self.history {
             write!(f, "{}", snap.temp_sig_bed())?;
         }
-        writeln!(f)?;
 
         if let Some(last) = self.history.last() {
             match last {
-                Snapshot::Ready { telemetry: temps } => writeln!(f, " ---% {}", temps)?,
+                Snapshot::Ready { telemetry: temps } => {
+                    writeln!(f)?;
+                    write!(f, " ---% {}", temps)?;
+                }
                 Snapshot::Active {
                     telemetry: temps,
                     done,
@@ -461,9 +463,12 @@ impl Display for PrinterStatus {
                     paused,
                     ..
                 } => {
+                    writeln!(f)?;
                     writeln!(f, "{:>3}% {}", done, temps)?;
+                    let bars = (done / 100.0 * self.info.opts.history as f32) as usize;
+                    writeln!(f, "{}", iter::repeat('#').take(bars).collect::<String>())?;
                     let end: DateTime<Local> = (SystemTime::now() + *time_left).into();
-                    writeln!(
+                    write!(
                         f,
                         "Printing: {} Left: {} Total: {} End: {}{} <{}>",
                         FormattedDur(*time_spent),
@@ -549,7 +554,7 @@ impl Printer {
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    printers: HashMap<String, Printer>,
+    printers: BTreeMap<String, Printer>,
 }
 
 impl Config {
@@ -577,7 +582,7 @@ async fn main() -> Result<(), Error> {
     let printers = if opts.printer.is_empty() {
         config.printers
     } else {
-        let mut pruned = HashMap::new();
+        let mut pruned = BTreeMap::new();
         for name in opts.printer {
             match config.printers.remove(&name) {
                 Some(printer) => {
