@@ -130,8 +130,8 @@ struct JobInner {
 
 #[derive(Debug, Deserialize)]
 struct JobResponse {
-    progress: Progress,
-    job: JobInner,
+    progress: Option<Progress>,
+    job: Option<JobInner>,
 }
 
 /// Spy & do statistics on a PrusaLink printer.
@@ -205,6 +205,7 @@ enum Snapshot {
     HttpErr,
     ConfigErr,
     MalformedErr,
+    Inconsistent,
     Ready {
         telemetry: Telemetry,
     },
@@ -219,7 +220,7 @@ enum Snapshot {
 }
 
 impl Snapshot {
-    fn from_parts(printer: PrinterResponse, job: JobResponse) -> Self {
+    fn from_parts(printer: PrinterResponse, job: JobResponse) -> Result<Self, StepErr> {
         let telemetry = Telemetry {
             bed_current: printer.temperature.bed.actual,
             bed_target: printer.temperature.bed.target,
@@ -232,18 +233,21 @@ impl Snapshot {
             || printer.state.flags.paused
             || printer.state.flags.pausing;
         let paused = printer.state.flags.paused || printer.state.flags.pausing;
-        if active {
+        let result = if active {
+            let progress = job.progress.ok_or(StepErr::Inconsistent)?;
+            let job = job.job.ok_or(StepErr::Inconsistent)?;
             Snapshot::Active {
-                done: job.progress.completion * 100.0,
-                time_spent: Duration::from_secs(job.progress.print_time),
-                time_left: Duration::from_secs(job.progress.print_time_left),
+                done: progress.completion * 100.0,
+                time_spent: Duration::from_secs(progress.print_time),
+                time_left: Duration::from_secs(progress.print_time_left),
                 telemetry,
                 paused,
-                name: job.job.file.name,
+                name: job.file.name,
             }
         } else {
             Snapshot::Ready { telemetry }
-        }
+        };
+        Ok(result)
     }
 
     fn sig(&self) -> char {
@@ -255,6 +259,7 @@ impl Snapshot {
             ConfigErr => '?',
             MalformedErr => 'M',
             Ready { .. } => '_',
+            Inconsistent => 'I',
             Active { paused: false, .. } => '#',
             Active { paused: true, .. } => '*',
         }
@@ -310,6 +315,8 @@ enum StepErr {
         err: JsonError,
         body: Option<Bytes>,
     },
+    #[error(display = "Inconsistent data")]
+    Inconsistent,
 }
 
 impl From<StepErr> for Snapshot {
@@ -321,6 +328,7 @@ impl From<StepErr> for Snapshot {
             StepErr::Reqwest(re) if re.is_decode() => Snapshot::MalformedErr,
             StepErr::Malformed { .. } => Snapshot::MalformedErr,
             StepErr::Reqwest(_) => Snapshot::HttpErr,
+            StepErr::Inconsistent => Snapshot::Inconsistent,
         }
     }
 }
@@ -375,7 +383,7 @@ impl PrinterStatus {
 
         let (printer, job) = self.get_info().await?;
 
-        Ok(Snapshot::from_parts(printer, job))
+        Ok(Snapshot::from_parts(printer, job)?)
     }
 
     fn store_snapshot(&mut self, snapshot: Snapshot) {
