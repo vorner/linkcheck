@@ -377,7 +377,7 @@ struct Opts {
     /// What printers to query.
     ///
     /// If not specified, all printers from the config file are used.
-    #[structopt(short, long)]
+    #[structopt(short, long, number_of_values(1))]
     printer: Vec<String>,
 
     /// Number of history samples.
