@@ -1,30 +1,37 @@
-use std::collections::BTreeMap;
+use std::cmp;
+use std::collections::{BTreeMap, VecDeque};
+use std::convert::Infallible;
 use std::env;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::fs::File;
+use std::fs::{self, File};
 use std::iter;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, Context, Error};
+use anyhow::{anyhow, bail, Context, Error};
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Local};
 use err_derive::Error;
 use futures::future;
+use futures::stream;
 use im::Vector;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
-use reqwest::{Client, Error as ReqwestError};
+use reqwest::multipart::{Form, Part};
+use reqwest::{Body, Client, Error as ReqwestError, Method, RequestBuilder};
 use serde::de::{DeserializeOwned, Deserializer};
 use serde::Deserialize;
-use serde_json::Error as JsonError;
+use serde_json::{Error as JsonError, Value};
 use structopt::StructOpt;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::watch::{channel, Receiver};
 use tokio::time::{self, Instant};
 
 const TEMP_DIFF: f32 = 3.0;
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
+const UPLOAD_CHUNK: usize = 1024;
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
         .http1_title_case_headers() // "Bug"/not-implemented proper http
@@ -42,7 +49,156 @@ struct FormattedDur(Duration);
 impl Display for FormattedDur {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         let dur = ChronoDuration::from_std(self.0).unwrap_or_else(|_| ChronoDuration::zero());
-        write!(f, "{:02}:{:02}:{:02}", dur.num_hours(), dur.num_minutes() % 60, dur.num_seconds() % 60)
+        write!(
+            f,
+            "{:02}:{:02}:{:02}",
+            dur.num_hours(),
+            dur.num_minutes() % 60,
+            dur.num_seconds() % 60
+        )
+    }
+}
+
+fn bars(c: char, bars: usize) -> String {
+    iter::repeat(c).take(bars).collect()
+}
+
+enum ProgressStep {
+    Start { total: usize },
+    Step { current: usize },
+    Finished,
+    Failed,
+}
+
+struct ProgressReportItem {
+    progress: ProgressStep,
+    upload: UploadName,
+}
+
+struct ProgressReport {
+    sender: UnboundedSender<ProgressReportItem>,
+    printer: Arc<str>,
+    name: Option<Arc<str>>,
+    // Names of yet unstarted files
+    scheduled: VecDeque<Arc<str>>,
+}
+
+impl ProgressReport {
+    fn report(&self, step: ProgressStep) {
+        let name = Arc::clone(self.name.as_ref().expect("Nothing to report on"));
+        let _ = self.sender.send(ProgressReportItem {
+            progress: step,
+            upload: UploadName {
+                printer: Arc::clone(&self.printer),
+                file: name,
+            },
+        });
+    }
+    fn start(&mut self) {
+        let next = self
+            .scheduled
+            .pop_front()
+            .expect("Start, but no file scheduled");
+        self.name = Some(next);
+    }
+    fn finish(&mut self) {
+        self.report(ProgressStep::Finished);
+        self.name.take();
+    }
+}
+
+impl Drop for ProgressReport {
+    fn drop(&mut self) {
+        if self.name.is_some() {
+            self.report(ProgressStep::Failed);
+        }
+        for scheduled in self.scheduled.drain(..) {
+            let _ = self.sender.send(ProgressReportItem {
+                progress: ProgressStep::Failed,
+                upload: UploadName {
+                    printer: Arc::clone(&self.printer),
+                    file: scheduled,
+                },
+            });
+        }
+    }
+}
+
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
+struct UploadName {
+    printer: Arc<str>,
+    file: Arc<str>,
+}
+
+impl Display for UploadName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}: {}", self.printer, self.file)
+    }
+}
+
+#[derive(Default)]
+struct ProgressReportWatch {
+    running: BTreeMap<UploadName, (usize, usize)>,
+    ok: Vec<UploadName>,
+    failed: Vec<UploadName>,
+    width: usize,
+}
+
+impl ProgressReportWatch {
+    fn new(width: usize) -> Self {
+        Self {
+            width,
+            ..Self::default()
+        }
+    }
+    fn feed(&mut self, report: ProgressReportItem) {
+        use ProgressStep::*;
+
+        match report.progress {
+            Start { total } => assert!(self.running.insert(report.upload, (0, total)).is_none()),
+            Step { current } => {
+                self.running
+                    .get_mut(&report.upload)
+                    .expect("Step on non-existent upload")
+                    .0 = current
+            }
+            Finished => {
+                assert!(self.running.remove(&report.upload).is_some());
+                self.ok.push(report.upload);
+            }
+            Failed => {
+                // It's possible to fail by not starting at all
+                self.running.remove(&report.upload);
+                self.failed.push(report.upload);
+            }
+        }
+    }
+}
+
+impl Display for ProgressReportWatch {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        let bar = bars('=', self.width);
+        writeln!(f, "{}", bar)?;
+        for (upload, (pos, total)) in &self.running {
+            writeln!(f, "{}: {}/{}", upload, pos, total)?;
+            let squares = self.width * pos / total;
+            writeln!(f, "{}", bars('#', squares))?;
+        }
+
+        writeln!(f, "{}", bar)?;
+        writeln!(f, "Uploaded:")?;
+        for name in &self.ok {
+            writeln!(f, "• {}", name)?;
+        }
+
+        writeln!(f, "{}", bar)?;
+        writeln!(f, "Failed:")?;
+        for name in &self.failed {
+            writeln!(f, "• {}", name)?;
+        }
+        write!(f, "{}", bar)?;
+
+        Ok(())
     }
 }
 
@@ -134,6 +290,87 @@ struct JobResponse {
     job: Option<JobInner>,
 }
 
+#[derive(Clone)]
+struct LoadedFile {
+    /// The name to pass to the other side (not necessarily the same as the file name)
+    name: Arc<str>,
+    /// The data to pass there
+    data: Bytes,
+    /// Start print?
+    start: bool,
+}
+
+impl LoadedFile {
+    fn load(f: &Path, original_name: bool, start: bool) -> Result<Self, Error> {
+        let data = fs::read(f)
+            .with_context(|| format!("Couldn't load {}", f.display()))?
+            .into();
+
+        match f.extension() {
+            Some(e) if e.eq_ignore_ascii_case("gco") || e.eq_ignore_ascii_case("gcode") => (),
+            _ => bail!("{} isn't gcode", f.display()),
+        };
+
+        let fname = f
+            .file_name()
+            .ok_or_else(|| anyhow!("No file name in {}", f.display()))?
+            .to_string_lossy();
+
+        let name = if original_name {
+            fname.into()
+        } else {
+            // Note: Seems like fat filesystems don't like ':' in the name!
+            format!("{}-{}", Local::now().format("%F-%H-%M-%S"), fname).into()
+        };
+
+        Ok(Self { data, name, start })
+    }
+    fn form(&self, reporter: Arc<ProgressReport>) -> Form {
+        let chunk_cnt = (self.data.len() + UPLOAD_CHUNK - 1) / UPLOAD_CHUNK;
+        reporter.report(ProgressStep::Start {
+            total: self.data.len(),
+        });
+        let data = self.data.clone();
+        let name = Arc::clone(&self.name);
+        let watched_stream = (0..chunk_cnt).map(move |i| {
+            let start = i * UPLOAD_CHUNK;
+            reporter.report(ProgressStep::Step { current: start });
+            let end = cmp::min(start + UPLOAD_CHUNK, data.len());
+            debug!("Preparing chunk {}/{} of {}", i, chunk_cnt, name);
+            Ok::<_, Infallible>(data.slice(start..end))
+        });
+        let watched_body = Body::wrap_stream(stream::iter(watched_stream));
+        let payload = Part::stream_with_length(watched_body, self.data.len() as u64)
+            .file_name(String::from(&*self.name));
+        Form::new()
+            .text("print", if self.start { "true" } else { "false" })
+            .part("file", payload)
+    }
+}
+
+#[derive(Debug, StructOpt)]
+enum Command {
+    Upload {
+        /// The file(s) to upload.
+        #[structopt(parse(from_os_str))]
+        file: Vec<PathBuf>,
+
+        /// Keep the original name.
+        ///
+        /// Usually, the tool renames the uploaded file to include timestamp, both for sorting and
+        /// to avoid duplicates. This avoids it and leaves the name intact.
+        #[structopt(long, short)]
+        original_name: bool,
+
+        /// Ask the printer to start the print right away.
+        ///
+        /// In case multiple files are uploaded, this is applied to the first one (we assume we are
+        /// uploading faster than printing).
+        #[structopt(long, short)]
+        start: bool,
+    },
+}
+
 /// Spy & do statistics on a PrusaLink printer.
 #[derive(Debug, StructOpt)]
 struct Opts {
@@ -158,12 +395,16 @@ struct Opts {
     /// Configuration file.
     ///
     /// Contains connection info for the printers. Yaml.
-    #[structopt(parse(from_os_str))]
+    #[structopt(short, long, parse(from_os_str))]
     config: Option<PathBuf>,
 
     /// Use raw ugly output to preserve logs and everything.
     #[structopt(long, short)]
     ugly: bool,
+
+    /// A command to execute on selected printer(s) instead of watching them.
+    #[structopt(subcommand)]
+    cmd: Option<Command>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -298,9 +539,106 @@ impl Snapshot {
 }
 
 struct PrinterInfo {
-    name: String,
+    name: Arc<str>,
     printer: Printer,
     opts: WatchOpts,
+}
+
+impl PrinterInfo {
+    fn watch(self) -> Receiver<PrinterStatus> {
+        let mut status = PrinterStatus {
+            info: Arc::new(self),
+            selected: None,
+            failed: 0,
+            history: Vector::new(),
+            alive: false,
+            last_duration: Duration::default(),
+        };
+        let (sender, receiver) = channel(status.clone());
+        tokio::spawn(async move {
+            loop {
+                let start = Instant::now();
+                let end = start + status.info.opts.interval;
+
+                status.step().await;
+
+                let _ = sender.send(status.clone());
+
+                time::sleep_until(end).await;
+            }
+        });
+        receiver
+    }
+
+    async fn select(&self) -> Result<SocketAddr, StepErr> {
+        if self.printer.addr.is_empty() {
+            return Err(StepErr::NoIps);
+        } else {
+            let candidates = self.printer.addr.iter().map(|&addr| {
+                Box::pin(async move {
+                    let version: VersionResponse = self.printer.req(addr, "api/version").await?;
+                    debug!(
+                        "Received version {}'s {:?} from {}",
+                        self.name, version, addr
+                    );
+                    Ok(addr)
+                })
+            });
+            future::select_ok(candidates).await.map(|(addr, _)| addr)
+        }
+    }
+
+    async fn upload(
+        &self,
+        files: Arc<[LoadedFile]>,
+        progress: UnboundedSender<ProgressReportItem>,
+    ) -> Result<(), Error> {
+        let expected = files.iter().map(|f| Arc::clone(&f.name)).collect();
+        let mut reporter = Arc::new(ProgressReport {
+            name: None,
+            printer: Arc::clone(&self.name),
+            sender: progress,
+            scheduled: expected,
+        });
+
+        debug!("Selection of {} started", self.name);
+
+        let addr = self.select().await?;
+
+        info!("Going to use {} for {}", addr, self.name);
+
+        for file in &*files {
+            info!("Uploading {} to {}", file.name, self.name);
+            Arc::get_mut(&mut reporter)
+                .expect("Shared reporter without upload")
+                .start();
+            let response = self
+                .printer
+                .req_any(addr, "api/files/local", Method::POST)
+                .multipart(file.form(Arc::clone(&reporter)))
+                .timeout(UPLOAD_TIMEOUT)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+
+            let resp_str = String::from_utf8_lossy(&response);
+            debug!("Received answer {} from {}", resp_str, self.name);
+
+            serde_json::from_slice::<Value>(&response)
+                .with_context(|| format!("Malformed response from {}: {}", self.name, resp_str))?;
+
+            info!("Uploaded {} to {}", file.name, self.name);
+            Arc::get_mut(&mut reporter)
+                .expect("Shared reporter without upload")
+                .finish();
+        }
+
+        info!("Everything uploaded to {}", self.name);
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -344,25 +682,6 @@ struct PrinterStatus {
 }
 
 impl PrinterStatus {
-    async fn select(&self) -> Result<SocketAddr, StepErr> {
-        if self.info.printer.addr.is_empty() {
-            return Err(StepErr::NoIps);
-        } else {
-            let candidates = self.info.printer.addr.iter().map(|&addr| {
-                Box::pin(async move {
-                    let version: VersionResponse =
-                        self.info.printer.req(addr, "api/version").await?;
-                    debug!(
-                        "Received version {}'s {:?} from {}",
-                        self.info.name, version, addr
-                    );
-                    Ok(addr)
-                })
-            });
-            future::select_ok(candidates).await.map(|(addr, _)| addr)
-        }
-    }
-
     async fn req<R: DeserializeOwned>(&self, path: &str) -> Result<R, StepErr> {
         self.info
             .printer
@@ -376,7 +695,7 @@ impl PrinterStatus {
 
     async fn step_inner(&mut self) -> Result<Snapshot, StepErr> {
         if self.selected.is_none() {
-            let selected = self.select().await?;
+            let selected = self.info.select().await?;
             info!("Selected {} for {}", selected, self.info.name);
             self.selected = Some(selected);
         }
@@ -420,18 +739,14 @@ impl PrinterStatus {
         }
         let took = now.elapsed();
 
-        debug!(
-            "Step on {} took {:?}",
-            self.info.name,
-            took
-        );
+        debug!("Step on {} took {:?}", self.info.name, took);
         self.last_duration = took;
     }
 }
 
 impl Display for PrinterStatus {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        writeln!(f, "{}", iter::repeat('=').take(self.info.opts.history).collect::<String>())?;
+        writeln!(f, "{}", bars('=', self.info.opts.history))?;
         if let Some(addr) = self.selected {
             writeln!(f, "{}: {} [{:?}]", self.info.name, addr, self.last_duration)?;
         } else {
@@ -473,8 +788,8 @@ impl Display for PrinterStatus {
                 } => {
                     writeln!(f)?;
                     writeln!(f, "{:>3}% {}", done, temps)?;
-                    let bars = (done / 100.0 * self.info.opts.history as f32) as usize;
-                    writeln!(f, "{}", iter::repeat('#').take(bars).collect::<String>())?;
+                    let squares = (done / 100.0 * self.info.opts.history as f32) as usize;
+                    writeln!(f, "{}", bars('#', squares))?;
                     let end: DateTime<Local> = (SystemTime::now() + *time_left).into();
                     write!(
                         f,
@@ -502,11 +817,15 @@ struct Printer {
 }
 
 impl Printer {
-    async fn req<R: DeserializeOwned>(&self, addr: SocketAddr, path: &str) -> Result<R, StepErr> {
+    fn req_any(&self, addr: SocketAddr, path: &str, method: Method) -> RequestBuilder {
         let url = format!("http://{}/{}", addr, path);
-        let response = HTTP_CLIENT
-            .get(url)
+        HTTP_CLIENT
+            .request(method, url)
             .header("X-Api-Key", &self.key)
+    }
+    async fn req<R: DeserializeOwned>(&self, addr: SocketAddr, path: &str) -> Result<R, StepErr> {
+        let response = self
+            .req_any(addr, path, Method::GET)
             .send()
             .await?
             .error_for_status()?
@@ -529,34 +848,6 @@ impl Printer {
                 })
             }
         }
-    }
-    fn watch(self, name: String, opts: WatchOpts) -> Receiver<PrinterStatus> {
-        let mut status = PrinterStatus {
-            info: Arc::new(PrinterInfo {
-                name,
-                printer: self,
-                opts,
-            }),
-            selected: None,
-            failed: 0,
-            history: Vector::new(),
-            alive: false,
-            last_duration: Duration::default(),
-        };
-        let (sender, receiver) = channel(status.clone());
-        tokio::spawn(async move {
-            loop {
-                let start = Instant::now();
-                let end = start + opts.interval;
-
-                status.step().await;
-
-                let _ = sender.send(status.clone());
-
-                time::sleep_until(end).await;
-            }
-        });
-        receiver
     }
 }
 
@@ -606,33 +897,107 @@ async fn main() -> Result<(), Error> {
         pruned
     };
 
-    debug!("Going to watch printers {:?}", printers.keys());
-
-    let mut watched_printers = Vec::new();
     let wopts = WatchOpts {
         history: opts.history,
         max_fail: opts.max_fail,
         interval: Duration::from_millis(opts.interval),
     };
-    for (name, printer) in printers {
-        let status = printer.watch(name.clone(), wopts);
-        watched_printers.push(status);
-    }
+    let printers = printers.into_iter().map(|(name, printer)| PrinterInfo {
+        printer,
+        name: name.into(),
+        opts: wopts,
+    });
 
-    if watched_printers.is_empty() {
-        bail!("No printers to watch");
-    }
+    match opts.cmd {
+        Some(Command::Upload {
+            file,
+            original_name,
+            start,
+        }) => {
+            let files = file
+                .into_iter()
+                .map(|file| {
+                    let f = LoadedFile::load(&file, original_name, start);
+                    if let Ok(f) = &f {
+                        debug!("Loaded {} ({} bytes)", file.display(), f.data.len());
+                    }
+                    f
+                })
+                .collect::<Result<_, Error>>()?;
 
-    loop {
-        if !opts.ugly {
-            print!("\x1B[2J\x1B[1;1H");
+            debug!("Data to upload loaded");
+
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let uploads = printers.into_iter().map(|printer| {
+                let files = Arc::clone(&files);
+                let sender = sender.clone();
+
+                async move {
+                    let res = printer.upload(files, sender).await;
+                    if let Err(e) = &res {
+                        error!("Upload to {} failed: {:?}", printer.name, e);
+                    }
+
+                    res
+                }
+            });
+
+            let uploads = future::join_all(uploads);
+            drop(sender);
+
+            let watch = async {
+                let mut progress = ProgressReportWatch::new(opts.history);
+                while let Some(report) = receiver.recv().await {
+                    progress.feed(report);
+
+                    // Try to process as many things as available before redrawing.
+                    while let Ok(report) = receiver.try_recv() {
+                        progress.feed(report);
+                    }
+
+                    if !opts.ugly {
+                        print!("\x1B[2J\x1B[1;1H");
+                    }
+
+                    println!("{}", progress);
+                }
+            };
+
+            let failed = future::join(uploads, watch)
+                .await
+                .0
+                .into_iter()
+                .filter(Result::is_err)
+                .count();
+
+            if failed > 0 {
+                bail!("Failed to upload to {} printers", failed);
+            }
         }
+        None => {
+            let mut watched_printers = printers
+                .into_iter()
+                .map(PrinterInfo::watch)
+                .collect::<Vec<_>>();
 
-        for printer in &mut watched_printers {
-            println!("{}", *printer.borrow_and_update());
+            if watched_printers.is_empty() {
+                bail!("No printers to watch");
+            }
+
+            loop {
+                if !opts.ugly {
+                    print!("\x1B[2J\x1B[1;1H");
+                }
+
+                for printer in &mut watched_printers {
+                    println!("{}", *printer.borrow_and_update());
+                }
+
+                let wait_for_changes = watched_printers.iter_mut().map(|p| Box::pin(p.changed()));
+                future::select_all(wait_for_changes).await.0?;
+            }
         }
-
-        let wait_for_changes = watched_printers.iter_mut().map(|p| Box::pin(p.changed()));
-        future::select_all(wait_for_changes).await.0?;
     }
+
+    Ok(())
 }
