@@ -380,9 +380,9 @@ struct Opts {
     #[structopt(short, long, number_of_values(1))]
     printer: Vec<String>,
 
-    /// Number of history samples.
-    #[structopt(short, long, default_value = "120")]
-    history: usize,
+    /// Number of display columns to use; sets the history size.
+    #[structopt(short, long)]
+    width: Option<usize>,
 
     /// Interval between iterations, in milliseconds.
     #[structopt(short, long, default_value = "1000")]
@@ -409,7 +409,7 @@ struct Opts {
 
 #[derive(Copy, Clone, Debug)]
 struct WatchOpts {
-    history: usize,
+    width: usize,
     max_fail: usize,
     interval: Duration,
 }
@@ -707,7 +707,7 @@ impl PrinterStatus {
 
     fn store_snapshot(&mut self, snapshot: Snapshot) {
         self.history.push_back(snapshot);
-        while self.history.len() > self.info.opts.history {
+        while self.history.len() > self.info.opts.width {
             self.history.pop_front();
         }
     }
@@ -746,7 +746,7 @@ impl PrinterStatus {
 
 impl Display for PrinterStatus {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        writeln!(f, "{}", bars('=', self.info.opts.history))?;
+        writeln!(f, "{}", bars('=', self.info.opts.width))?;
         if let Some(addr) = self.selected {
             writeln!(f, "{}: {} [{:?}]", self.info.name, addr, self.last_duration)?;
         } else {
@@ -788,7 +788,7 @@ impl Display for PrinterStatus {
                 } => {
                     writeln!(f)?;
                     writeln!(f, "{:>3}% {}", done, temps)?;
-                    let squares = (done / 100.0 * self.info.opts.history as f32) as usize;
+                    let squares = (done / 100.0 * self.info.opts.width as f32) as usize;
                     writeln!(f, "{}", bars('#', squares))?;
                     let end: DateTime<Local> = (SystemTime::now() + *time_left).into();
                     write!(
@@ -851,9 +851,17 @@ impl Printer {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DisplayConfig {
+    width: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 struct Config {
     printers: BTreeMap<String, Printer>,
+
+    #[serde(default)]
+    display: DisplayConfig,
 }
 
 impl Config {
@@ -897,8 +905,10 @@ async fn main() -> Result<(), Error> {
         pruned
     };
 
+    let display_width = opts.width.or(config.display.width).unwrap_or(180);
+
     let wopts = WatchOpts {
-        history: opts.history,
+        width: display_width,
         max_fail: opts.max_fail,
         interval: Duration::from_millis(opts.interval),
     };
@@ -946,7 +956,7 @@ async fn main() -> Result<(), Error> {
             drop(sender);
 
             let watch = async {
-                let mut progress = ProgressReportWatch::new(opts.history);
+                let mut progress = ProgressReportWatch::new(display_width);
                 while let Some(report) = receiver.recv().await {
                     progress.feed(report);
 
