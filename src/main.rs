@@ -34,11 +34,10 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
 const UPLOAD_CHUNK: usize = 1024;
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
-        .http1_title_case_headers() // "Bug"/not-implemented proper http
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(5))
         .connection_verbose(true)
-        .pool_max_idle_per_host(1)
+        .pool_max_idle_per_host(2)
         .http1_only()
         .build()
         .unwrap()
