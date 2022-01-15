@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -56,11 +56,13 @@ fn bars(c: char, bars: usize) -> String {
     iter::repeat(c).take(bars).collect()
 }
 
+#[derive(Clone)]
 enum ProgressStep {
     Start { total: usize },
     Step { current: usize },
     Finished,
-    Failed,
+    Failed(String),
+    Abandoned,
 }
 
 struct ProgressReportItem {
@@ -68,56 +70,124 @@ struct ProgressReportItem {
     upload: UploadName,
 }
 
-struct ProgressReport {
+struct Reporter {
+    name: UploadName,
     sender: UnboundedSender<ProgressReportItem>,
-    printer: Arc<str>,
-    name: Option<Arc<str>>,
-    // Names of yet unstarted files
-    scheduled: VecDeque<Arc<str>>,
 }
 
-impl ProgressReport {
+impl Reporter {
+    fn report(&self, step: ProgressStep) {
+        let _ = self.sender.send(ProgressReportItem {
+            progress: step,
+            upload: self.name.clone(),
+        });
+    }
+}
+
+struct Uploader<'a> {
+    sender: UnboundedSender<ProgressReportItem>,
+    printer: &'a Printer,
+    printer_name: Arc<str>,
+    name: Option<Arc<str>>,
+    // Names of yet unstarted files
+    scheduled: &'a [LoadedFile],
+}
+
+impl Uploader<'_> {
     fn report(&self, step: ProgressStep) {
         let name = Arc::clone(self.name.as_ref().expect("Nothing to report on"));
         let _ = self.sender.send(ProgressReportItem {
             progress: step,
             upload: UploadName {
-                printer: Arc::clone(&self.printer),
+                printer: Arc::clone(&self.printer_name),
                 file: name,
             },
         });
     }
-    fn start(&mut self) {
-        let next = self
-            .scheduled
-            .pop_front()
-            .expect("Start, but no file scheduled");
-        self.name = Some(next);
+    fn report_all(mut self, step: ProgressStep) {
+        for scheduled in self.scheduled {
+            let _ = self.sender.send(ProgressReportItem {
+                progress: step.clone(),
+                upload: UploadName {
+                    printer: Arc::clone(&self.printer_name),
+                    file: Arc::clone(&scheduled.name),
+                },
+            });
+        }
+        self.scheduled = &[];
     }
-    fn finish(&mut self) {
-        self.report(ProgressStep::Finished);
-        self.name.take();
+    fn reporter(&self) -> Reporter {
+        Reporter {
+            sender: self.sender.clone(),
+            name: UploadName {
+                printer: Arc::clone(&self.printer_name),
+                file: Arc::clone(self.name.as_ref().expect("Nothing to report on")),
+            },
+        }
+    }
+    async fn upload_one(&mut self, addr: SocketAddr, file: &LoadedFile) -> Result<(), Error> {
+        let response = self
+            .printer
+            .req_any(addr, "api/files/local", Method::POST)
+            .multipart(file.form(self.reporter()))
+            .timeout(UPLOAD_TIMEOUT)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+
+        let resp_str = String::from_utf8_lossy(&response);
+        debug!("Received answer {} from {}", resp_str, self.printer_name);
+
+        serde_json::from_slice::<Value>(&response).with_context(|| {
+            format!(
+                "Malformed response from {}: {}",
+                self.printer_name, resp_str
+            )
+        })?;
+        Ok(())
+    }
+    async fn upload(mut self, addr: SocketAddr) -> Result<(), Error> {
+        while !self.scheduled.is_empty() {
+            let file = &self.scheduled[0];
+            let name = &file.name;
+            self.name = Some(Arc::clone(name));
+            self.scheduled = &self.scheduled[1..];
+            info!("Uploading {} to {}", name, self.printer_name);
+
+            if let Err(e) = self.upload_one(addr, file).await {
+                self.report(ProgressStep::Failed(e.to_string()));
+                return Err(e);
+            };
+
+            info!("Uploaded {} to {}", name, self.printer_name);
+            self.report(ProgressStep::Finished);
+            self.name.take();
+        }
+
+        Ok(())
     }
 }
 
-impl Drop for ProgressReport {
+impl Drop for Uploader<'_> {
     fn drop(&mut self) {
         if self.name.is_some() {
-            self.report(ProgressStep::Failed);
+            self.report(ProgressStep::Abandoned);
         }
-        for scheduled in self.scheduled.drain(..) {
+        for scheduled in self.scheduled {
             let _ = self.sender.send(ProgressReportItem {
-                progress: ProgressStep::Failed,
+                progress: ProgressStep::Abandoned,
                 upload: UploadName {
-                    printer: Arc::clone(&self.printer),
-                    file: scheduled,
+                    printer: Arc::clone(&self.printer_name),
+                    file: Arc::clone(&scheduled.name),
                 },
             });
         }
     }
 }
 
-#[derive(Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct UploadName {
     printer: Arc<str>,
     file: Arc<str>,
@@ -129,11 +199,26 @@ impl Display for UploadName {
     }
 }
 
+struct FailedUpload {
+    upload: UploadName,
+    error: Option<String>,
+}
+
+impl Display for FailedUpload {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        if let Some(error) = &self.error {
+            write!(f, "{} ({})", self.upload, error)
+        } else {
+            self.upload.fmt(f)
+        }
+    }
+}
+
 #[derive(Default)]
 struct ProgressReportWatch {
     running: BTreeMap<UploadName, (usize, usize)>,
     ok: Vec<UploadName>,
-    failed: Vec<UploadName>,
+    failed: Vec<FailedUpload>,
     width: usize,
 }
 
@@ -159,10 +244,19 @@ impl ProgressReportWatch {
                 assert!(self.running.remove(&report.upload).is_some());
                 self.ok.push(report.upload);
             }
-            Failed => {
+            Failed(error) => {
                 // It's possible to fail by not starting at all
                 self.running.remove(&report.upload);
-                self.failed.push(report.upload);
+                self.failed.push(FailedUpload {
+                    upload: report.upload,
+                    error: Some(error),
+                });
+            }
+            Abandoned => {
+                self.failed.push(FailedUpload {
+                    upload: report.upload,
+                    error: None,
+                });
             }
         }
     }
@@ -318,7 +412,7 @@ impl LoadedFile {
 
         Ok(Self { data, name, start })
     }
-    fn form(&self, reporter: Arc<ProgressReport>) -> Form {
+    fn form(&self, reporter: Reporter) -> Form {
         let chunk_cnt = (self.data.len() + UPLOAD_CHUNK - 1) / UPLOAD_CHUNK;
         reporter.report(ProgressStep::Start {
             total: self.data.len(),
@@ -586,47 +680,27 @@ impl PrinterInfo {
         files: Arc<[LoadedFile]>,
         progress: UnboundedSender<ProgressReportItem>,
     ) -> Result<(), Error> {
-        let expected = files.iter().map(|f| Arc::clone(&f.name)).collect();
-        let mut reporter = Arc::new(ProgressReport {
+        let uploader = Uploader {
             name: None,
-            printer: Arc::clone(&self.name),
+            printer: &self.printer,
+            printer_name: Arc::clone(&self.name),
             sender: progress,
-            scheduled: expected,
-        });
+            scheduled: &files,
+        };
 
         debug!("Selection of {} started", self.name);
 
-        let addr = self.select().await?;
+        let addr = match self.select().await {
+            Ok(addr) => addr,
+            Err(e) => {
+                uploader.report_all(ProgressStep::Failed(e.to_string()));
+                return Err(e.into());
+            }
+        };
 
         info!("Going to use {} for {}", addr, self.name);
 
-        for file in &*files {
-            info!("Uploading {} to {}", file.name, self.name);
-            Arc::get_mut(&mut reporter)
-                .expect("Shared reporter without upload")
-                .start();
-            let response = self
-                .printer
-                .req_any(addr, "api/files/local", Method::POST)
-                .multipart(file.form(Arc::clone(&reporter)))
-                .timeout(UPLOAD_TIMEOUT)
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?;
-
-            let resp_str = String::from_utf8_lossy(&response);
-            debug!("Received answer {} from {}", resp_str, self.name);
-
-            serde_json::from_slice::<Value>(&response)
-                .with_context(|| format!("Malformed response from {}: {}", self.name, resp_str))?;
-
-            info!("Uploaded {} to {}", file.name, self.name);
-            Arc::get_mut(&mut reporter)
-                .expect("Shared reporter without upload")
-                .finish();
-        }
+        uploader.upload(addr).await?;
 
         info!("Everything uploaded to {}", self.name);
 
@@ -636,11 +710,11 @@ impl PrinterInfo {
 
 #[derive(Debug, Error)]
 enum StepErr {
-    #[error(display = "HTTP error")]
+    #[error(display = "HTTP error: {}", _0)]
     Reqwest(#[error(source)] ReqwestError),
     #[error(display = "No IPs to connect to")]
     NoIps,
-    #[error(display = "Malformed error")]
+    #[error(display = "Malformed error: {}", err)]
     Malformed {
         #[error(source)]
         err: JsonError,
@@ -964,17 +1038,20 @@ async fn main() -> Result<(), Error> {
 
                     println!("{}", progress);
                 }
+
+                progress
             };
 
-            let failed = future::join(uploads, watch)
-                .await
-                .0
-                .into_iter()
-                .filter(Result::is_err)
-                .count();
+            let progress = future::join(uploads, watch).await.1;
 
-            if failed > 0 {
-                bail!("Failed to upload to {} printers", failed);
+            let failed = &progress.failed;
+
+            if failed.len() > 0 {
+                eprintln!("Failures:");
+                for f in failed {
+                    eprintln!("• {}", f);
+                }
+                bail!("Failed to upload to {} printers", failed.len());
             }
         }
         None => {
