@@ -48,13 +48,7 @@ struct FormattedDur(Duration);
 impl Display for FormattedDur {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         let dur = ChronoDuration::from_std(self.0).unwrap_or_else(|_| ChronoDuration::zero());
-        write!(
-            f,
-            "{:02}:{:02}:{:02}",
-            dur.num_hours(),
-            dur.num_minutes() % 60,
-            dur.num_seconds() % 60
-        )
+        write!(f, "{:02}:{:02}", dur.num_hours(), dur.num_minutes() % 60)
     }
 }
 
