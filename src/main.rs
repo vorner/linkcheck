@@ -640,6 +640,8 @@ impl PrinterInfo {
             history: Vector::new(),
             alive: false,
             last_duration: Duration::default(),
+            success_reqs: 0,
+            failed_reqs: 0,
         };
         let (sender, receiver) = channel(status.clone());
         tokio::spawn(async move {
@@ -746,6 +748,8 @@ struct PrinterStatus {
     history: Vector<Snapshot>,
     alive: bool,
     last_duration: Duration,
+    success_reqs: u32,
+    failed_reqs: u32,
 }
 
 impl PrinterStatus {
@@ -785,6 +789,7 @@ impl PrinterStatus {
             Ok(snapshot) => {
                 self.failed = 0;
                 self.alive = true;
+                self.success_reqs = self.success_reqs.saturating_add(1);
                 self.store_snapshot(snapshot);
             }
             Err(e) => {
@@ -799,7 +804,11 @@ impl PrinterStatus {
                             previous.unwrap()
                         );
                         self.alive = false;
+                        self.success_reqs = 0;
+                        self.failed_reqs = 0;
                     }
+                } else {
+                    self.failed_reqs = self.failed_reqs.saturating_add(1);
                 }
                 self.store_snapshot(e.into());
             }
@@ -815,7 +824,11 @@ impl Display for PrinterStatus {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         writeln!(f, "{}", bars('=', self.info.opts.width))?;
         if let Some(addr) = self.selected {
-            writeln!(f, "{}: {} [{:?}]", self.info.name, addr, self.last_duration)?;
+            writeln!(
+                f,
+                "{}: {} [{:?}] ✔: {:?} ✘: {:?}",
+                self.info.name, addr, self.last_duration, self.success_reqs, self.failed_reqs
+            )?;
         } else {
             writeln!(
                 f,
