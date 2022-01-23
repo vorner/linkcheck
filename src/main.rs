@@ -34,7 +34,7 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
 const UPLOAD_CHUNK: usize = 1024;
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .connection_verbose(true)
         .pool_max_idle_per_host(2)
@@ -214,9 +214,15 @@ impl Display for FailedUpload {
     }
 }
 
+struct UploadProgress {
+    total: usize,
+    done: usize,
+    start: Instant,
+}
+
 #[derive(Default)]
 struct ProgressReportWatch {
-    running: BTreeMap<UploadName, (usize, usize)>,
+    running: BTreeMap<UploadName, UploadProgress>,
     ok: Vec<UploadName>,
     failed: Vec<FailedUpload>,
     width: usize,
@@ -233,12 +239,19 @@ impl ProgressReportWatch {
         use ProgressStep::*;
 
         match report.progress {
-            Start { total } => assert!(self.running.insert(report.upload, (0, total)).is_none()),
+            Start { total } => {
+                let running = UploadProgress {
+                    total,
+                    done: 0,
+                    start: Instant::now(),
+                };
+                assert!(self.running.insert(report.upload, running).is_none());
+            },
             Step { current } => {
                 self.running
                     .get_mut(&report.upload)
                     .expect("Step on non-existent upload")
-                    .0 = current
+                    .done = current
             }
             Finished => {
                 assert!(self.running.remove(&report.upload).is_some());
@@ -266,9 +279,14 @@ impl Display for ProgressReportWatch {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         let bar = bars('=', self.width);
         writeln!(f, "{}", bar)?;
-        for (upload, (pos, total)) in &self.running {
-            writeln!(f, "{}: {}/{}", upload, pos, total)?;
-            let squares = self.width * pos / total;
+        for (upload, progress) in &self.running {
+            let mut elapsed = progress.start.elapsed();
+            if elapsed == Duration::default() {
+                elapsed = Duration::from_millis(1);
+            }
+            let speed = (progress.done as f64) / elapsed.as_secs_f64();
+            writeln!(f, "{}: {}/{} @{}", upload, progress.done, progress.total, speed.round())?;
+            let squares = self.width * progress.done / progress.total;
             writeln!(f, "{}", bars('#', squares))?;
         }
 
