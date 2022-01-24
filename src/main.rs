@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_json::{Error as JsonError, Value};
 use structopt::StructOpt;
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::watch::{channel, Receiver};
 use tokio::time::{self, Instant};
 
@@ -1222,41 +1223,47 @@ async fn main() -> Result<(), Error> {
             let mut running = BTreeMap::new();
 
             let watch = async {
-                while let Some(report) = receiver.recv().await {
-                    match report {
-                        DownloadProgressItem::Step { download, done } => {
-                            running
-                                .entry(download)
-                                .or_insert_with(|| (Instant::now(), 0))
-                                .1 = done;
+                'outer: loop {
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(DownloadProgressItem::Step { download, done }) => {
+                                running
+                                    .entry(download)
+                                    .or_insert_with(|| (Instant::now(), 0))
+                                    .1 = done;
+                            }
+                            Ok(DownloadProgressItem::Done(name)) => {
+                                running.remove(&name);
+                            }
+                            Ok(DownloadProgressItem::NotPrinting(_)) => (),
+                            Ok(DownloadProgressItem::PrinterError { printer, err }) => {
+                                errors.push(format!("{}: {}", printer, err));
+                            }
+                            Ok(DownloadProgressItem::TransferError { download, err }) => {
+                                running.remove(&download);
+                                errors.push(format!("{}: {}", download, err));
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => break 'outer,
                         }
-                        DownloadProgressItem::Done(name) => {
-                            running.remove(&name);
-                        }
-                        DownloadProgressItem::NotPrinting(_) => (),
-                        DownloadProgressItem::PrinterError { printer, err } => {
-                            errors.push(format!("{}: {}", printer, err));
-                        }
-                        DownloadProgressItem::TransferError { download, err } => {
-                            running.remove(&download);
-                            errors.push(format!("{}: {}", download, err));
-                        }
-                    }
-
-                    if !opts.ugly {
-                        print!("\x1B[2J\x1B[1;1H");
-                    }
-
-                    for (transfer, status) in &running {
-                        println!("{}: {} @{}", transfer, status.1, speed(status.0, status.1));
-                    }
-
-                    println!("{}", bars('=', display_width));
-
-                    for err in &errors {
-                        println!("{}", err);
                     }
                 }
+
+                if !opts.ugly {
+                    print!("\x1B[2J\x1B[1;1H");
+                }
+
+                for (transfer, status) in &running {
+                    println!("{}: {} @{}", transfer, status.1, speed(status.0, status.1));
+                }
+
+                println!("{}", bars('=', display_width));
+
+                for err in &errors {
+                    println!("{}", err);
+                }
+
+                time::sleep(Duration::from_secs(1)).await;
             };
 
             future::join(downloads, watch).await;
