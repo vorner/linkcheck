@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Error as IoError, Write as _};
 use std::iter;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Local};
 use err_derive::Error;
 use futures::future;
 use futures::stream;
+use futures::StreamExt;
 use im::Vector;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
@@ -30,7 +32,7 @@ use tokio::sync::watch::{channel, Receiver};
 use tokio::time::{self, Instant};
 
 const TEMP_DIFF: f32 = 3.0;
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
 const UPLOAD_CHUNK: usize = 1024;
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
@@ -67,11 +69,11 @@ enum ProgressStep {
 
 struct ProgressReportItem {
     progress: ProgressStep,
-    upload: UploadName,
+    upload: TransferName,
 }
 
 struct Reporter {
-    name: UploadName,
+    name: TransferName,
     sender: UnboundedSender<ProgressReportItem>,
 }
 
@@ -98,7 +100,7 @@ impl Uploader<'_> {
         let name = Arc::clone(self.name.as_ref().expect("Nothing to report on"));
         let _ = self.sender.send(ProgressReportItem {
             progress: step,
-            upload: UploadName {
+            upload: TransferName {
                 printer: Arc::clone(&self.printer_name),
                 file: name,
             },
@@ -108,7 +110,7 @@ impl Uploader<'_> {
         for scheduled in self.scheduled {
             let _ = self.sender.send(ProgressReportItem {
                 progress: step.clone(),
-                upload: UploadName {
+                upload: TransferName {
                     printer: Arc::clone(&self.printer_name),
                     file: Arc::clone(&scheduled.name),
                 },
@@ -119,7 +121,7 @@ impl Uploader<'_> {
     fn reporter(&self) -> Reporter {
         Reporter {
             sender: self.sender.clone(),
-            name: UploadName {
+            name: TransferName {
                 printer: Arc::clone(&self.printer_name),
                 file: Arc::clone(self.name.as_ref().expect("Nothing to report on")),
             },
@@ -130,7 +132,7 @@ impl Uploader<'_> {
             .printer
             .req_any(addr, "api/files/local", Method::POST)
             .multipart(file.form(self.reporter()))
-            .timeout(UPLOAD_TIMEOUT)
+            .timeout(TRANSFER_TIMEOUT)
             .send()
             .await?
             .error_for_status()?
@@ -178,7 +180,7 @@ impl Drop for Uploader<'_> {
         for scheduled in self.scheduled {
             let _ = self.sender.send(ProgressReportItem {
                 progress: ProgressStep::Abandoned,
-                upload: UploadName {
+                upload: TransferName {
                     printer: Arc::clone(&self.printer_name),
                     file: Arc::clone(&scheduled.name),
                 },
@@ -188,19 +190,19 @@ impl Drop for Uploader<'_> {
 }
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct UploadName {
+struct TransferName {
     printer: Arc<str>,
     file: Arc<str>,
 }
 
-impl Display for UploadName {
+impl Display for TransferName {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}: {}", self.printer, self.file)
     }
 }
 
 struct FailedUpload {
-    upload: UploadName,
+    upload: TransferName,
     error: Option<String>,
 }
 
@@ -222,8 +224,8 @@ struct UploadProgress {
 
 #[derive(Default)]
 struct ProgressReportWatch {
-    running: BTreeMap<UploadName, UploadProgress>,
-    ok: Vec<UploadName>,
+    running: BTreeMap<TransferName, UploadProgress>,
+    ok: Vec<TransferName>,
     failed: Vec<FailedUpload>,
     width: usize,
 }
@@ -246,7 +248,7 @@ impl ProgressReportWatch {
                     start: Instant::now(),
                 };
                 assert!(self.running.insert(report.upload, running).is_none());
-            },
+            }
             Step { current } => {
                 self.running
                     .get_mut(&report.upload)
@@ -275,17 +277,28 @@ impl ProgressReportWatch {
     }
 }
 
+fn speed(start: Instant, transfered: usize) -> u32 {
+    let mut elapsed = start.elapsed();
+    if elapsed == Duration::default() {
+        elapsed = Duration::from_millis(1);
+    }
+    let speed = (transfered as f64) / elapsed.as_secs_f64();
+    speed.round() as _
+}
+
 impl Display for ProgressReportWatch {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         let bar = bars('=', self.width);
         writeln!(f, "{}", bar)?;
         for (upload, progress) in &self.running {
-            let mut elapsed = progress.start.elapsed();
-            if elapsed == Duration::default() {
-                elapsed = Duration::from_millis(1);
-            }
-            let speed = (progress.done as f64) / elapsed.as_secs_f64();
-            writeln!(f, "{}: {}/{} @{}", upload, progress.done, progress.total, speed.round())?;
+            writeln!(
+                f,
+                "{}: {}/{} @{}",
+                upload,
+                progress.done,
+                progress.total,
+                speed(progress.start, progress.done),
+            )?;
             let squares = self.width * progress.done / progress.total;
             writeln!(f, "{}", bars('#', squares))?;
         }
@@ -382,6 +395,7 @@ struct Progress {
 #[derive(Debug, Deserialize)]
 struct JobFile {
     name: String,
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,6 +469,7 @@ impl LoadedFile {
 
 #[derive(Debug, StructOpt)]
 enum Command {
+    /// Upload a file to the printer.
     Upload {
         /// The file(s) to upload.
         #[structopt(parse(from_os_str))]
@@ -474,6 +489,8 @@ enum Command {
         #[structopt(long, short)]
         start: bool,
     },
+    /// Grab the currently printed file.
+    Grab,
 }
 
 /// Spy & do statistics on a PrusaLink printer.
@@ -726,6 +743,110 @@ impl PrinterInfo {
 
         Ok(())
     }
+
+    async fn grab(&self, progress: UnboundedSender<DownloadProgressItem>) {
+        macro_rules! rtry {
+            ($action: expr, $err: expr) => {
+                match $action {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let _ = progress.send($err(err));
+                        return;
+                    }
+                }
+            };
+        }
+
+        let addr = rtry!(self.select().await, |err: StepErr| {
+            DownloadProgressItem::PrinterError {
+                printer: Arc::clone(&self.name),
+                err: err.to_string(),
+            }
+        });
+
+        let job: JobResponse = rtry!(
+            self.printer.req::<JobResponse>(addr, "api/job").await,
+            |err: StepErr| {
+                DownloadProgressItem::PrinterError {
+                    printer: Arc::clone(&self.name),
+                    err: err.to_string(),
+                }
+            }
+        );
+
+        let job = match job.job {
+            None => {
+                let _ = progress.send(DownloadProgressItem::NotPrinting(Arc::clone(&self.name)));
+                return;
+            }
+            Some(job) => job,
+        };
+
+        let file: Arc<str> = job.file.name.into();
+        let path = job.file.path.as_deref().unwrap_or(&file);
+        let name = TransferName {
+            printer: Arc::clone(&self.name),
+            file: Arc::clone(&file),
+        };
+
+        let response = rtry!(
+            self.printer
+                .req_any(addr, &format!("api/files/{}", path), Method::GET)
+                .timeout(TRANSFER_TIMEOUT)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status()),
+            |err: ReqwestError| {
+                DownloadProgressItem::TransferError {
+                    download: name,
+                    err: err.to_string(),
+                }
+            }
+        );
+
+        let mut data = response.bytes_stream();
+        let mut done = 0;
+        let mut dest = rtry!(
+            OpenOptions::new().create_new(true).write(true).open(&*file),
+            |err: IoError| {
+                DownloadProgressItem::TransferError {
+                    download: name,
+                    err: err.to_string(),
+                }
+            }
+        );
+
+        while let Some(chunk) = data.next().await {
+            let chunk = rtry!(chunk, |err: ReqwestError| {
+                DownloadProgressItem::TransferError {
+                    download: name,
+                    err: err.to_string(),
+                }
+            });
+            done += chunk.len();
+            rtry!(dest.write_all(&chunk), |err: IoError| {
+                DownloadProgressItem::TransferError {
+                    download: name,
+                    err: err.to_string(),
+                }
+            });
+
+            let _ = progress.send(DownloadProgressItem::Step {
+                download: name.clone(),
+                done,
+            });
+        }
+
+        let _ = progress.send(DownloadProgressItem::Done(name));
+    }
+}
+
+enum DownloadProgressItem {
+    Step { download: TransferName, done: usize },
+    Done(TransferName),
+    NotPrinting(Arc<str>),
+    PrinterError { printer: Arc<str>, err: String },
+    TransferError { download: TransferName, err: String },
 }
 
 #[derive(Debug, Error)]
@@ -1083,6 +1204,65 @@ async fn main() -> Result<(), Error> {
                     eprintln!("• {}", f);
                 }
                 bail!("Failed to upload to {} printers", failed.len());
+            }
+        }
+        Some(Command::Grab) => {
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let downloads = printers.into_iter().map(|printer| {
+                let sender = sender.clone();
+
+                async move {
+                    printer.grab(sender).await;
+                }
+            });
+            let downloads = future::join_all(downloads);
+            drop(sender);
+
+            let mut errors = Vec::new();
+            let mut running = BTreeMap::new();
+
+            let watch = async {
+                while let Some(report) = receiver.recv().await {
+                    match report {
+                        DownloadProgressItem::Step { download, done } => {
+                            running
+                                .entry(download)
+                                .or_insert_with(|| (Instant::now(), 0))
+                                .1 = done;
+                        }
+                        DownloadProgressItem::Done(name) => {
+                            running.remove(&name);
+                        }
+                        DownloadProgressItem::NotPrinting(_) => (),
+                        DownloadProgressItem::PrinterError { printer, err } => {
+                            errors.push(format!("{}: {}", printer, err));
+                        }
+                        DownloadProgressItem::TransferError { download, err } => {
+                            running.remove(&download);
+                            errors.push(format!("{}: {}", download, err));
+                        }
+                    }
+
+                    if !opts.ugly {
+                        print!("\x1B[2J\x1B[1;1H");
+                    }
+
+                    for (transfer, status) in &running {
+                        println!("{}: {} @{}", transfer, status.1, speed(status.0, status.1));
+                    }
+
+                    println!("{}", bars('=', display_width));
+
+                    for err in &errors {
+                        println!("{}", err);
+                    }
+                }
+            };
+
+            future::join(downloads, watch).await;
+
+            for err in errors {
+                eprintln!("{}\n", err);
             }
         }
         None => {
