@@ -1247,26 +1247,30 @@ async fn main() -> Result<(), Error> {
                             Err(TryRecvError::Disconnected) => break 'outer,
                         }
                     }
+
+                    if !opts.ugly {
+                        print!("\x1B[2J\x1B[1;1H");
+                    }
+
+                    for (transfer, status) in &running {
+                        println!("{}: {} @{}", transfer, status.1, speed(status.0, status.1));
+                    }
+
+                    println!("{}", bars('=', display_width));
+
+                    for err in &errors {
+                        println!("{}", err);
+                    }
+
+                    time::sleep(Duration::from_secs(1)).await;
                 }
-
-                if !opts.ugly {
-                    print!("\x1B[2J\x1B[1;1H");
-                }
-
-                for (transfer, status) in &running {
-                    println!("{}: {} @{}", transfer, status.1, speed(status.0, status.1));
-                }
-
-                println!("{}", bars('=', display_width));
-
-                for err in &errors {
-                    println!("{}", err);
-                }
-
-                time::sleep(Duration::from_secs(1)).await;
             };
 
             future::join(downloads, watch).await;
+
+            if !opts.ugly {
+                print!("\x1B[2J\x1B[1;1H");
+            }
 
             for err in errors {
                 eprintln!("{}\n", err);
