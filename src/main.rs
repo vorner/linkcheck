@@ -278,13 +278,12 @@ impl ProgressReportWatch {
     }
 }
 
-fn speed(start: Instant, transfered: usize) -> u32 {
+fn speed(start: Instant, transfered: usize) -> f64 {
     let mut elapsed = start.elapsed();
     if elapsed == Duration::default() {
         elapsed = Duration::from_millis(1);
     }
-    let speed = (transfered as f64) / elapsed.as_secs_f64();
-    speed.round() as _
+    (transfered as f64) / elapsed.as_secs_f64() / 1000.0
 }
 
 impl Display for ProgressReportWatch {
@@ -294,7 +293,7 @@ impl Display for ProgressReportWatch {
         for (upload, progress) in &self.running {
             writeln!(
                 f,
-                "{}: {}/{} @{}",
+                "{}: {}/{} @{:.1} kB",
                 upload,
                 progress.done,
                 progress.total,
@@ -1253,7 +1252,7 @@ async fn main() -> Result<(), Error> {
                     }
 
                     for (transfer, status) in &running {
-                        println!("{}: {} @{}", transfer, status.1, speed(status.0, status.1));
+                        println!("{}: {} @{:.1} kB", transfer, status.1, speed(status.0, status.1));
                     }
 
                     println!("{}", bars('=', display_width));
