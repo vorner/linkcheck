@@ -40,7 +40,7 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .connection_verbose(true)
-        .pool_max_idle_per_host(2)
+        .pool_max_idle_per_host(1)
         .http1_only()
         .build()
         .unwrap()
